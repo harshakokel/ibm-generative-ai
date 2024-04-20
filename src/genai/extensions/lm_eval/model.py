@@ -1,5 +1,6 @@
 import json
 from collections import defaultdict
+from functools import cached_property
 from typing import Any, Iterator, NamedTuple, Optional, Type, cast
 
 from genai import Client, Credentials
@@ -97,6 +98,10 @@ class IBMGenAILMEval(LM):
         )
         self._generation_execution_options = generation_execution_options or self.DEFAULT_GENERATION_EXECUTION_OPTIONS
 
+    @cached_property
+    def model_token_limit(self):
+        return self._client.model.retrieve(id=self._model_id).result.token_limits[0].token_limit
+
     def dump_parameters(self):
         return self._parameters.model_dump()
 
@@ -127,21 +132,24 @@ class IBMGenAILMEval(LM):
 
         """
         context_length = len(context_tokens)
-        if response_tokens[: context_length - 1] == context_tokens[:-1]:
-            if response_tokens[-1].startswith(context_tokens[-1]):
-                raise RuntimeError(
-                    f"The context sent to loglikelihood evaluation ends with a token that is substring of the "
-                    f"continuation token:\n"
-                    f"context_tokens={context_tokens}\n"
-                    f"response_tokens={response_tokens[:context_length]}\n"
-                    "This is not allowed as it would skew the results. Please check your data."
-                )
-            return response_tokens[:context_length][-1] != context_tokens[-1]
-        raise RuntimeError(
-            f"There is an unexpected difference between tokenizer and model tokens:\n"
-            f"context_tokens={context_tokens}\n"
-            f"response_tokens={response_tokens[:context_length]}"
-        )
+        if response_tokens[: context_length - 1] != context_tokens[: context_length - 1]:
+            raise RuntimeError(
+                f"There is an unexpected difference between tokenizer and model tokens:\n"
+                f"context_tokens={context_tokens}\n"
+                f"response_tokens={response_tokens[:context_length]}"
+            )
+
+        last_context_token = context_tokens[context_length - 1]
+        last_context_token_resp = response_tokens[context_length - 1]
+        if last_context_token != last_context_token_resp and last_context_token_resp.startswith(last_context_token):
+            raise RuntimeError(
+                f"The context sent to loglikelihood evaluation ends with a token ({last_context_token}) "
+                f"that is substring of the continuation token ({last_context_token_resp}).\n"
+                f"context_tokens={context_tokens}\n"
+                f"response_tokens={response_tokens[:context_length]}\n"
+                "This is not allowed as it would skew the results. Please check your data."
+            )
+        return last_context_token != last_context_token_resp
 
     def _check_model_logprobs_support(self):
         input_tokens = (
@@ -281,8 +289,12 @@ class IBMGenAILMEval(LM):
             decoding_method = DecodingMethod.SAMPLE if do_sample else DecodingMethod.GREEDY
             until = generation_parameters.pop("until")
             stop_sequences = [until] if isinstance(until, str) else until
-            max_new_tokens = generation_parameters.pop("max_gen_toks", None)
+            stop_sequences.append("<|endoftext|>")
+            # Use same default 256 token limit as huggingface
+            # https://github.com/EleutherAI/lm-evaluation-harness/blob/7852985b2b5352df147067e01a121c52297f8821/lm_eval/models/huggingface.py#L392
+            max_new_tokens = generation_parameters.pop("max_gen_toks", 256)
             temperature = generation_parameters.pop("temperature", None)
+            truncate_input_tokens = self.model_token_limit - max_new_tokens
 
             parameters = TextGenerationParameters.model_validate(
                 {
@@ -291,6 +303,7 @@ class IBMGenAILMEval(LM):
                     "stop_sequences": stop_sequences,
                     "temperature": temperature,
                     "max_new_tokens": max_new_tokens,
+                    "truncate_input_tokens": truncate_input_tokens,
                 }
             )
 
